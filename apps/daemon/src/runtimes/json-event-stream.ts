@@ -299,6 +299,147 @@ function handleOpenCodeEvent(obj: unknown, onEvent: StreamEventHandler, state: P
   return false;
 }
 
+/**
+ * Event parser for `omp --mode json` (oh-my-pi). omp is a pi fork whose JSON
+ * mode emits the pi event vocabulary (agent_start/turn_start/message_update/
+ * message_end/turn_end/agent_end, tool_execution_start/end) as NDJSON on
+ * stdout. Field shapes match `mapPiRpcEvent` (toolCallId/toolName/args/
+ * result.content[].text), so this handler mirrors that mapping in the
+ * json-event-stream style. omp's `session` frame (first line) carries the
+ * session id used for capture-style resume via `--resume=<id>`.
+ */
+function handleOmpEvent(obj: unknown, onEvent: StreamEventHandler, state: ParserState): boolean {
+  if (!isRecord(obj)) return false;
+
+  if (obj.type === 'session') {
+    const sessionId = typeof obj.id === 'string' && obj.id.length > 0 ? obj.id : null;
+    onEvent({ type: 'status', label: 'running', sessionId });
+    return true;
+  }
+
+  if (obj.type === 'agent_start') {
+    onEvent({ type: 'status', label: 'working' });
+    return true;
+  }
+  if (obj.type === 'agent_end') {
+    return true;
+  }
+  if (obj.type === 'turn_start') {
+    onEvent({ type: 'status', label: 'thinking' });
+    return true;
+  }
+
+  if (obj.type === 'turn_end') {
+    const message = isRecord(obj.message) ? obj.message : null;
+    const usage = isRecord(message?.usage) ? message.usage : null;
+    if (usage) {
+      const formatted: Usage = {};
+      if (typeof usage.input === 'number') formatted.input_tokens = usage.input;
+      if (typeof usage.output === 'number') formatted.output_tokens = usage.output;
+      if (typeof usage.cacheRead === 'number') formatted.cached_read_tokens = usage.cacheRead;
+      if (typeof usage.cacheWrite === 'number') formatted.cached_write_tokens = usage.cacheWrite;
+      if (Object.keys(formatted).length > 0) {
+        const cost = isRecord(usage.cost) ? usage.cost : null;
+        onEvent({
+          type: 'usage',
+          usage: formatted,
+          costUsd: typeof cost?.total === 'number' ? cost.total : undefined,
+        });
+      }
+    }
+    if (message?.stopReason === 'error') {
+      const messageText =
+        typeof message.errorMessage === 'string' && message.errorMessage.length > 0
+          ? message.errorMessage
+          : 'omp agent error';
+      onEvent({ type: 'error', message: messageText, raw: stringifyContent(obj) });
+    }
+    return true;
+  }
+
+  if (obj.type === 'message_update') {
+    const ev = isRecord(obj.assistantMessageEvent) ? obj.assistantMessageEvent : null;
+    if (!ev) return false;
+    if (ev.type === 'text_delta' && typeof ev.delta === 'string') {
+      onEvent({ type: 'text_delta', delta: ev.delta });
+      return true;
+    }
+    if (ev.type === 'thinking_delta' && typeof ev.delta === 'string') {
+      onEvent({ type: 'thinking_delta', delta: ev.delta });
+      return true;
+    }
+    if (ev.type === 'thinking_start') {
+      onEvent({ type: 'thinking_start' });
+      return true;
+    }
+    if (ev.type === 'thinking_end') {
+      onEvent({ type: 'thinking_end' });
+      return true;
+    }
+    if (ev.type === 'error') {
+      const message =
+        typeof ev.reason === 'string' && ev.reason.length > 0
+          ? ev.reason
+          : typeof ev.delta === 'string' && ev.delta.length > 0
+            ? ev.delta
+            : 'Agent error';
+      onEvent({ type: 'error', message, raw: stringifyContent(obj) });
+      return true;
+    }
+    // Known-but-no-op assistant event frames (text_start/text_end,
+    // toolcall_start/delta/end — tool rows stream from
+    // tool_execution_start/end instead) are consumed.
+    return true;
+  }
+
+  // message_start/end carry full message snapshots; deltas already streamed
+  // from message_update, so they are consumed without re-emitting text.
+  if (obj.type === 'message_start' || obj.type === 'message_end') {
+    return true;
+  }
+
+  if (obj.type === 'tool_execution_start') {
+    onEvent({
+      type: 'tool_use',
+      id: obj.toolCallId ?? null,
+      name: obj.toolName ?? null,
+      input: obj.args ?? null,
+    });
+    return true;
+  }
+
+  if (obj.type === 'tool_execution_end') {
+    const result = isRecord(obj.result) ? obj.result : null;
+    const content = result?.content;
+    const text =
+      Array.isArray(content)
+        ? content
+            .map((c: unknown) => {
+              const item = isRecord(c) ? c : null;
+              return item?.type === 'text' ? String(item.text ?? '') : stringifyContent(c);
+            })
+            .join('\n')
+        : typeof content === 'string'
+          ? content
+          : '';
+    onEvent({
+      type: 'tool_result',
+      toolUseId: obj.toolCallId ?? null,
+      content: text,
+      isError: obj.isError === true,
+    });
+    return true;
+  }
+
+  // omp-only informational frames (advisor yields, extension chatter) are
+  // consumed so they never leak into the transcript as raw events.
+  if (obj.type === 'advisor_yielded' || obj.type === 'advisor_cost_changed') {
+    return true;
+  }
+
+  return false;
+}
+
 function handleGeminiEvent(obj: unknown, onEvent: StreamEventHandler, state: ParserState): boolean {
   if (!isRecord(obj)) return false;
 
@@ -1412,6 +1553,7 @@ export function createJsonEventStreamHandler(
     openCodeChildEvidence?.observe(obj);
 
     if (kind === 'opencode' && handleOpenCodeEvent(obj, onEvent, state)) return;
+    if (kind === 'omp' && handleOmpEvent(obj, onEvent, state)) return;
     if (kind === 'gemini' && handleGeminiEvent(obj, onEvent, state)) return;
     if (kind === 'kimi' && handleKimiEvent(obj, onEvent)) return;
     if (kind === 'cursor-agent' && handleCursorEvent(obj, onEvent, state)) return;

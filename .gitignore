@@ -103,3 +103,6 @@ deploy/agent-bins/
 # Python bytecode from workflow helper self-checks / local compile.
 __pycache__/
 *.py[cod]
+
+# Local agent session scratch (omp CLI sessions); never commit.
+omp-sessions/
