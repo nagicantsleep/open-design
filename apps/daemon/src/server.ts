@@ -2906,9 +2906,18 @@ const pluginShareTaskStore = createPluginShareTaskStore({
 // files live under metadata.baseDir.
 let projectMetadataLookup: ((id: string) => Record<string, unknown> | null) | null = null;
 
+/** Reserve names in multipart order, even when directory preparation finishes out of order. */
+function queueProjectUploadNaming(req) {
+  const previous = req._uploadNamingTail ?? Promise.resolve();
+  let release: () => void;
+  req._uploadNamingTail = new Promise<void>((resolve) => { release = resolve; });
+  return { previous, release: () => release() };
+}
+
 const projectUpload = multer({
   storage: multer.diskStorage({
     destination: async (req, _file, cb) => {
+      const naming = queueProjectUploadNaming(req);
       try {
         // Route uploads into the project's actual root: for folder-imported
         // projects (metadata.baseDir set) attachments need to land alongside
@@ -2929,11 +2938,17 @@ const projectUpload = multer({
           subdir,
           meta,
         );
+        // Multer invokes filename synchronously from this callback. Keep
+        // directory I/O concurrent, but let earlier file parts reserve first.
+        await naming.previous;
         (req as any)._uploadRelDir = relDir;
         (req as any)._uploadAbsDir = absDir;
         cb(null, absDir);
       } catch (err) {
+        await naming.previous;
         cb(err, '');
+      } finally {
+        naming.release();
       }
     },
     filename: (req, file, cb) => {
@@ -9373,7 +9388,7 @@ export async function startServer({
     authorizeProjectToolRequest,
   });
 
-  registerVelaRoutes(app, {
+  const velaRoutesLifecycle = registerVelaRoutes(app, {
     paths: { RUNTIME_DATA_DIR },
     appConfig: { readAppConfig },
     http: { getPublicBaseUrl },
@@ -13484,6 +13499,9 @@ export async function startServer({
       ));
     };
 
+    // The catalog default an AMR turn switches to when vela rejects the
+    // selected model, e.g. one that has left the catalog since it was saved.
+    let amrFallbackModel = null;
     if (def.id === 'amr' && resolvedBin && agentLaunch.launchPath) {
       const launchPath = agentLaunch.launchPath ?? resolvedBin;
       const modelProbeEnv = launchPath
@@ -13602,6 +13620,7 @@ export async function startServer({
         ));
         return finishStrategyAwarePhysicalRun('failed', 1, null);
       }
+      amrFallbackModel = defaultRunModel && defaultRunModel !== safeModel ? defaultRunModel : null;
       // NOTE: when the selected model is absent from the (possibly preset-only
       // or stale) catalog we intentionally do NOT fail-close. The cached/preset
       // catalog can lag the live one, and a logged-in user picked a concrete
@@ -15738,6 +15757,7 @@ export async function startServer({
         executionProfile,
         completePromptOnTurnEnd: def.acpTurnEndCompletesPrompt === true,
         ...(def.id === 'amr' ? { modelUnavailableErrorCode: 'AMR_MODEL_UNAVAILABLE' } : {}),
+        ...(def.id === 'amr' && amrFallbackModel ? { fallbackModel: amrFallbackModel } : {}),
         // Resume the prior upstream session (drives `session/load`) when the
         // resume-identity guard says it is safe; otherwise a fresh session/new.
         ...(def.resumesSessionViaAcpLoad === true && agentResumePromptPolicy.resumeSessionId
@@ -16964,6 +16984,7 @@ export async function startServer({
               service: internalRunCreation,
               task: strategyTaskAtStart,
               parsed: strategyProtocolResult,
+              locale: typeof locale === 'string' ? locale : undefined,
               completionEvidence: {
                 physicalStatus: 'succeeded', deliverableValid,
                 truncated: run.truncatedMidTurn === true,
@@ -16998,13 +17019,14 @@ export async function startServer({
                 };
                 automaticContinuationChatBody = {
                   ...meta,
+                  // The frozen task/source/index identify this internal request.
+                  // A fresh host-protocol nonce must not change its retry identity.
                   requestFingerprint: createHash('sha256')
                     .update(JSON.stringify({
                       taskExecutionId: strategyTaskAtStart.taskExecutionId,
                       sourceRunId: run.id,
                       stage,
                       taskRunIndex,
-                      instruction,
                       projectId: meta.projectId,
                       conversationId: meta.conversationId,
                       agentId: meta.agentId,
@@ -17914,7 +17936,7 @@ export async function startServer({
   //   - `apps/daemon/sidecar/server.ts`     → expects `{ url, server }`
   //   - `apps/daemon/tests/version-route.test.ts` → expects `{ url, server }`
   return await new Promise((resolve, reject) => {
-    let daemonShutdownStarted = false;
+    let daemonShutdownPromise: Promise<void> | null = null;
     const clearTerminalTelemetryFallbackTimers = () => {
       for (const timer of terminalTelemetryFallbackTimers) clearTimeout(timer);
       terminalTelemetryFallbackTimers.clear();
@@ -17951,23 +17973,26 @@ export async function startServer({
       collabPublishWatcher.dispose();
       collabCloud?.dispose();
     };
-    const shutdownDaemonRuns = async () => {
-      if (daemonShutdownStarted) return;
-      daemonShutdownStarted = true;
-      daemonShuttingDown = true;
-      amrTerminalReportDelivery.stop();
-      clearTerminalTelemetryFallbackTimers();
-      const shutdownGraceMs = resolveChatRunShutdownGraceMs();
-      await design.runs.shutdownActive({ graceMs: shutdownGraceMs });
-      // Cleanup runs independently of user terminal classification. Give
-      // confirmed closed writers at most three additional seconds at shutdown.
-      const cleanupDrain = await codexThreadCleanupOwner.drain(shutdownGraceMs);
-      if (cleanupDrain.pending > 0) {
-        console.warn('[codex] closed-thread cleanup shutdown deadline reached', cleanupDrain);
-      }
-      await terminalService.shutdownActive();
-      await browserSessionService.shutdownActive();
-      await design.analytics.shutdown();
+    const shutdownDaemonRuns = (): Promise<void> => {
+      if (daemonShutdownPromise) return daemonShutdownPromise;
+      daemonShutdownPromise = (async () => {
+        daemonShuttingDown = true;
+        await velaRoutesLifecycle.close();
+        amrTerminalReportDelivery.stop();
+        clearTerminalTelemetryFallbackTimers();
+        const shutdownGraceMs = resolveChatRunShutdownGraceMs();
+        await design.runs.shutdownActive({ graceMs: shutdownGraceMs });
+        // Cleanup runs independently of user terminal classification. Give
+        // confirmed closed writers at most three additional seconds at shutdown.
+        const cleanupDrain = await codexThreadCleanupOwner.drain(shutdownGraceMs);
+        if (cleanupDrain.pending > 0) {
+          console.warn('[codex] closed-thread cleanup shutdown deadline reached', cleanupDrain);
+        }
+        await terminalService.shutdownActive();
+        await browserSessionService.shutdownActive();
+        await design.analytics.shutdown();
+      })();
+      return daemonShutdownPromise;
     };
     let server;
     try {
