@@ -7,7 +7,7 @@ const prevDataDir = process.env.OD_DATA_DIR;
 
 function withDataDir(value: string | undefined, fn: () => void) {
   if (value === undefined) delete process.env.OD_DATA_DIR;
-  else process.env.OD_DATA_DIR = value;
+  else process.env.OD_DATA_DIR = value ?? "";
   try {
     fn();
   } finally {
@@ -50,9 +50,11 @@ test('omp session args fall back to cwd when OD_DATA_DIR is unset', () => {
   try {
     const args = ompSessionArgs({});
     assert.equal(args[0], '--session-dir');
+    assert.ok(typeof args[1] === 'string');
     assert.match(args[1], /omp-sessions$/);
     assert.ok(!args.includes('--resume'));
   } finally {
-    if (prevDataDir !== undefined) process.env.OD_DATA_DIR = prevDataDir;
+    if (prevDataDir === undefined) delete process.env.OD_DATA_DIR;
+    else process.env.OD_DATA_DIR = prevDataDir;
   }
 });
