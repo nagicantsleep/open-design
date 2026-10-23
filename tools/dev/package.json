@@ -27,9 +27,6 @@
   "optionalDependencies": {
     "@powerformer/vela-cli": "0.1.7"
   },
-  "optionalDependencies": {
-    "@powerformer/vela-cli": "0.1.4-test.0"
-  },
   "engines": {
     "node": "~24"
   }
